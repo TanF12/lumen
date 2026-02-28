@@ -77,23 +77,21 @@ pub fn parse_markdown(content: &str) -> (BTreeMap<String, minijinja::Value>, Str
         if let Some(end_idx) = content[after_start..].find("\n---") {
             let fm_str = &content[after_start..after_start + end_idx];
 
-            if let Ok(docs) = YamlLoader::load_from_str(fm_str) {
-                if let Some(doc) = docs.first() {
-                    if let Yaml::Hash(hash) = doc {
-                        for (k, v) in hash {
-                            if let Yaml::String(k_str) = k {
-                                meta.insert(k_str.clone(), yaml_to_minijinja(v));
-                            }
-                        }
+            if let Ok(docs) = YamlLoader::load_from_str(fm_str)
+                && let Some(Yaml::Hash(hash)) = docs.first()
+            {
+                for (k, v) in hash {
+                    if let Yaml::String(k_str) = k {
+                        meta.insert(k_str.clone(), yaml_to_minijinja(v));
                     }
                 }
             }
 
             let remainder = &content[after_start + end_idx..];
-            if remainder.starts_with("\n---\r\n") {
-                body = &remainder[6..];
-            } else if remainder.starts_with("\n---\n") {
-                body = &remainder[5..];
+            if let Some(stripped) = remainder.strip_prefix("\n---\r\n") {
+                body = stripped;
+            } else if let Some(stripped) = remainder.strip_prefix("\n---\n") {
+                body = stripped;
             } else {
                 body = &remainder[4..];
             }

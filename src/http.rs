@@ -69,20 +69,19 @@ fn serve_markdown(
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
-    if state.config.performance.enable_caching {
-        if let Some(entry) = state.page_cache.get(&md_path.to_path_buf()) {
-            if entry.mtime == mtime {
-                return send_response(
-                    stream,
-                    200,
-                    entry.html.as_bytes(),
-                    "text/html; charset=utf-8",
-                    keep_alive,
-                    state,
-                    None,
-                );
-            }
-        }
+    if state.config.performance.enable_caching
+        && let Some(entry) = state.page_cache.get(&md_path.to_path_buf())
+        && entry.mtime == mtime
+    {
+        return send_response(
+            stream,
+            200,
+            entry.html.as_bytes(),
+            "text/html; charset=utf-8",
+            keep_alive,
+            state,
+            None,
+        );
     }
 
     if let Ok(content) = fs::read_to_string(md_path) {
@@ -162,40 +161,37 @@ pub fn serve_path(
         format!("{}.md", target)
     };
 
-    if let Some(md_path) = secure_join(&state.base_dir, &md_target) {
-        if fs::metadata(&md_path).map(|m| m.is_file()).unwrap_or(false) {
-            return serve_markdown(stream, &md_path, keep_alive, state);
-        }
+    if let Some(md_path) = secure_join(&state.base_dir, &md_target)
+        && fs::metadata(&md_path).map(|m| m.is_file()).unwrap_or(false)
+    {
+        return serve_markdown(stream, &md_path, keep_alive, state);
     }
 
-    if !is_dir {
-        if let Some(target_path) = secure_join(&state.base_dir, target) {
-            if let Ok(metadata) = fs::metadata(&target_path) {
-                if metadata.is_dir() {
-                    let encoded_location =
-                        utf8_percent_encode(&format!("{}/", normalized), PATH_ENCODE_SET)
-                            .to_string();
-                    let escaped_html = escape_html(&normalized);
-                    let redirect_html = format!(
-                        "301 Moved Permanently: <a href=\"{}\">{}/</a>",
-                        encoded_location, escaped_html
-                    );
+    if !is_dir
+        && let Some(target_path) = secure_join(&state.base_dir, target)
+        && let Ok(metadata) = fs::metadata(&target_path)
+        && metadata.is_dir()
+    {
+        let encoded_location =
+            utf8_percent_encode(&format!("{}/", normalized), PATH_ENCODE_SET).to_string();
+        let escaped_html = escape_html(&normalized);
+        let redirect_html = format!(
+            "301 Moved Permanently: <a href=\"{}\">{}/</a>",
+            encoded_location, escaped_html
+        );
 
-                    send_headers(
-                        stream,
-                        301,
-                        "text/html",
-                        redirect_html.len() as u64,
-                        keep_alive,
-                        state,
-                        Some(&format!("Location: {}\r\n", encoded_location)),
-                    )?;
-                    stream.write_all(redirect_html.as_bytes())?;
-                    stream.flush()?;
-                    return Ok((keep_alive, 301));
-                }
-            }
-        }
+        send_headers(
+            stream,
+            301,
+            "text/html",
+            redirect_html.len() as u64,
+            keep_alive,
+            state,
+            Some(&format!("Location: {}\r\n", encoded_location)),
+        )?;
+        stream.write_all(redirect_html.as_bytes())?;
+        stream.flush()?;
+        return Ok((keep_alive, 301));
     }
 
     let static_target = if is_dir {
@@ -204,133 +200,127 @@ pub fn serve_path(
         target.to_string()
     };
 
-    if let Some(static_path) = secure_join(&state.base_dir, &static_target) {
-        if let Ok(canon) = static_path.canonicalize() {
-            let base_canon = state
-                .base_dir
-                .canonicalize()
-                .unwrap_or_else(|_| state.base_dir.clone());
-            if !canon.starts_with(&base_canon) {
-                return send_error(stream, 403, b"403 Forbidden", keep_alive, state);
-            }
+    if let Some(static_path) = secure_join(&state.base_dir, &static_target)
+        && let Ok(canon) = static_path.canonicalize()
+    {
+        let base_canon = state
+            .base_dir
+            .canonicalize()
+            .unwrap_or_else(|_| state.base_dir.clone());
+        if !canon.starts_with(&base_canon) {
+            return send_error(stream, 403, b"403 Forbidden", keep_alive, state);
+        }
 
-            if let Some(ext) = canon.extension() {
-                if ext.to_string_lossy().eq_ignore_ascii_case("md") {
-                    return send_error(stream, 403, b"403 Forbidden", keep_alive, state);
-                }
-            }
+        if let Some(ext) = canon.extension()
+            && ext.to_string_lossy().eq_ignore_ascii_case("md")
+        {
+            return send_error(stream, 403, b"403 Forbidden", keep_alive, state);
+        }
 
-            if let Ok(mut file) = File::open(&canon) {
-                if let Ok(metadata) = file.metadata() {
-                    if metadata.is_file() {
-                        let mime = get_mime_type(&canon);
-                        let mut range_start = 0;
-                        let mut range_end = metadata.len().saturating_sub(1);
-                        let mut is_partial = false;
+        if let Ok(mut file) = File::open(&canon)
+            && let Ok(metadata) = file.metadata()
+            && metadata.is_file()
+        {
+            let mime = get_mime_type(&canon);
+            let mut range_start = 0;
+            let mut range_end = metadata.len().saturating_sub(1);
+            let mut is_partial = false;
 
-                        for h in headers {
-                            if h.name.eq_ignore_ascii_case("range") {
-                                if let Ok(range_val) = std::str::from_utf8(h.value) {
-                                    if range_val.starts_with("bytes=") {
-                                        let parts: Vec<&str> = range_val[6..].split('-').collect();
-                                        if parts.len() == 2 {
-                                            let start_str = parts[0].trim();
-                                            let end_str = parts[1].trim();
-                                            if start_str.is_empty() && !end_str.is_empty() {
-                                                if let Ok(suffix) = end_str.parse::<u64>() {
-                                                    if suffix > 0 {
-                                                        range_start =
-                                                            metadata.len().saturating_sub(suffix);
-                                                        range_end =
-                                                            metadata.len().saturating_sub(1);
-                                                        is_partial = true;
-                                                    }
-                                                }
-                                            } else if !start_str.is_empty() {
-                                                if let Ok(s) = start_str.parse::<u64>() {
-                                                    range_start = s;
-                                                    is_partial = true;
-                                                    if !end_str.is_empty() {
-                                                        if let Ok(e) = end_str.parse::<u64>() {
-                                                            range_end = e.min(
-                                                                metadata.len().saturating_sub(1),
-                                                            );
-                                                        }
-                                                    } else {
-                                                        range_end =
-                                                            metadata.len().saturating_sub(1);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+            for h in headers {
+                if h.name.eq_ignore_ascii_case("range") {
+                    if let Ok(range_val) = std::str::from_utf8(h.value)
+                        && let Some(stripped) = range_val.strip_prefix("bytes=")
+                    {
+                        let parts: Vec<&str> = stripped.split('-').collect();
+                        if parts.len() == 2 {
+                            let start_str = parts[0].trim();
+                            let end_str = parts[1].trim();
+
+                            if start_str.is_empty() && !end_str.is_empty() {
+                                if let Ok(suffix) = end_str.parse::<u64>()
+                                    && suffix > 0
+                                {
+                                    range_start = metadata.len().saturating_sub(suffix);
+                                    range_end = metadata.len().saturating_sub(1);
+                                    is_partial = true;
                                 }
-                                break;
+                            } else if !start_str.is_empty()
+                                && let Ok(s) = start_str.parse::<u64>()
+                            {
+                                range_start = s;
+                                is_partial = true;
+                                if !end_str.is_empty() {
+                                    if let Ok(e) = end_str.parse::<u64>() {
+                                        range_end = e.min(metadata.len().saturating_sub(1));
+                                    }
+                                } else {
+                                    range_end = metadata.len().saturating_sub(1);
+                                }
                             }
                         }
-
-                        if is_partial && (range_start > range_end || range_start >= metadata.len())
-                        {
-                            let extra = format!("Content-Range: bytes */{}\r\n", metadata.len());
-                            send_headers(
-                                stream,
-                                416,
-                                "text/plain",
-                                21,
-                                keep_alive,
-                                state,
-                                Some(&extra),
-                            )?;
-                            stream.write_all(b"Range Not Satisfiable")?;
-                            stream.flush()?;
-                            return Ok((keep_alive, 416));
-                        }
-
-                        let content_length = if metadata.len() == 0 {
-                            0
-                        } else {
-                            range_end - range_start + 1
-                        };
-                        let status = if is_partial { 206 } else { 200 };
-
-                        let mut extra_headers = String::with_capacity(128);
-                        if !mime.contains("html") {
-                            extra_headers.push_str("Cache-Control: public, max-age=86400\r\n");
-                        }
-                        extra_headers.push_str("Accept-Ranges: bytes\r\n");
-                        if is_partial {
-                            extra_headers.push_str(&format!(
-                                "Content-Range: bytes {}-{}/{}\r\n",
-                                range_start,
-                                range_end,
-                                metadata.len()
-                            ));
-                            file.seek(SeekFrom::Start(range_start))?;
-                        }
-
-                        send_headers(
-                            stream,
-                            status,
-                            &mime,
-                            content_length,
-                            keep_alive,
-                            state,
-                            Some(&extra_headers),
-                        )?;
-
-                        if is_partial {
-                            let mut reader =
-                                std::io::BufReader::with_capacity(65536, file.take(content_length));
-                            std::io::copy(&mut reader, stream)?;
-                        } else {
-                            std::io::copy(&mut file, stream)?;
-                        }
-
-                        stream.flush()?;
-                        return Ok((keep_alive, status));
                     }
+                    break;
                 }
             }
+
+            if is_partial && (range_start > range_end || range_start >= metadata.len()) {
+                let extra = format!("Content-Range: bytes */{}\r\n", metadata.len());
+                send_headers(
+                    stream,
+                    416,
+                    "text/plain",
+                    21,
+                    keep_alive,
+                    state,
+                    Some(&extra),
+                )?;
+                stream.write_all(b"Range Not Satisfiable")?;
+                stream.flush()?;
+                return Ok((keep_alive, 416));
+            }
+
+            let content_length = if metadata.len() == 0 {
+                0
+            } else {
+                range_end - range_start + 1
+            };
+            let status = if is_partial { 206 } else { 200 };
+
+            let mut extra_headers = String::with_capacity(128);
+            if !mime.contains("html") {
+                extra_headers.push_str("Cache-Control: public, max-age=86400\r\n");
+            }
+            extra_headers.push_str("Accept-Ranges: bytes\r\n");
+            if is_partial {
+                extra_headers.push_str(&format!(
+                    "Content-Range: bytes {}-{}/{}\r\n",
+                    range_start,
+                    range_end,
+                    metadata.len()
+                ));
+                file.seek(SeekFrom::Start(range_start))?;
+            }
+
+            send_headers(
+                stream,
+                status,
+                &mime,
+                content_length,
+                keep_alive,
+                state,
+                Some(&extra_headers),
+            )?;
+
+            if is_partial {
+                let mut reader =
+                    std::io::BufReader::with_capacity(65536, file.take(content_length));
+                std::io::copy(&mut reader, stream)?;
+            } else {
+                std::io::copy(&mut file, stream)?;
+            }
+
+            stream.flush()?;
+            return Ok((keep_alive, status));
         }
     }
 
@@ -349,16 +339,15 @@ pub fn is_keep_alive(req: &Request) -> bool {
         .headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case("connection"))
+        && let Ok(val) = std::str::from_utf8(h.value)
     {
-        if let Ok(val) = std::str::from_utf8(h.value) {
-            if val.eq_ignore_ascii_case("keep-alive") {
-                return true;
-            }
-            if val.eq_ignore_ascii_case("close") {
-                return false;
-            }
-            return val.to_lowercase().contains("keep-alive");
+        if val.eq_ignore_ascii_case("keep-alive") {
+            return true;
         }
+        if val.eq_ignore_ascii_case("close") {
+            return false;
+        }
+        return val.to_lowercase().contains("keep-alive");
     }
     is_http11
 }

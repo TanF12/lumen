@@ -57,26 +57,24 @@ pub fn start_server(config: Config) {
 
     let pool = ThreadPool::new(config.server.threads, config.server.queue_size);
 
-    for stream in listener.incoming() {
-        if let Ok(mut stream) = stream {
-            let _ = stream.set_nodelay(true);
+    for mut stream in listener.incoming().flatten() {
+        let _ = stream.set_nodelay(true);
 
-            let state_clone = Arc::clone(&state);
+        let state_clone = Arc::clone(&state);
 
-            match stream.try_clone() {
-                Ok(stream_clone) => {
-                    if pool
-                        .execute(move || handle_connection(stream_clone, state_clone))
-                        .is_err()
-                    {
-                        warn!("Queue full, shedding load with 503.");
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-                        let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-                    }
+        match stream.try_clone() {
+            Ok(stream_clone) => {
+                if pool
+                    .execute(move || handle_connection(stream_clone, state_clone))
+                    .is_err()
+                {
+                    warn!("Queue full, shedding load with 503.");
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                    let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
                 }
-                Err(e) => {
-                    error!("Failed to clone stream: {}", e);
-                }
+            }
+            Err(e) => {
+                error!("Failed to clone stream: {}", e);
             }
         }
     }
