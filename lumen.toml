@@ -1,0 +1,24 @@
+[server]
+host = "0.0.0.0"
+port = 8080
+name = "Lumen/1.0"
+threads = 16
+queue_size = 2000
+read_timeout_secs = 10
+write_timeout_secs = 15
+
+[paths]
+content_dir = "content"
+theme_file = "themes/default/index.html"
+fallback_404 = "<h1>404 - File Not Found</h1>"
+
+[security]
+x_frame_options = "DENY"
+x_content_type_options = "nosniff"
+content_security_policy = "default-src 'self'; style-src 'self' 'unsafe-inline'; media-src 'self'"
+cors_allow_origin = "*"
+
+[performance]
+connection_buffer_size = 65536
+enable_caching = true
+max_cache_items = 1024
