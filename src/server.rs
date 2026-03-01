@@ -1,14 +1,17 @@
 use httparse::Request;
 use minijinja::Environment;
+use rustls::{ServerConnection, StreamOwned};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufReader, Read, Write},
     net::{TcpListener, TcpStream},
+    path::Path,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use tracing::{debug, error, info, warn};
 
@@ -19,65 +22,173 @@ use crate::{
     thread_pool::ThreadPool,
 };
 
+pub enum LumenStream {
+    Plain(TcpStream),
+    Tls(Box<StreamOwned<ServerConnection, TcpStream>>),
+}
+
+impl Read for LumenStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf),
+            Self::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for LumenStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
+impl LumenStream {
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.set_read_timeout(dur),
+            Self::Tls(s) => s.sock.set_read_timeout(dur),
+        }
+    }
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.set_write_timeout(dur),
+            Self::Tls(s) => s.sock.set_write_timeout(dur),
+        }
+    }
+}
+
+fn load_certs(path: &Path) -> std::io::Result<Vec<CertificateDer<'static>>> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
+}
+
+fn load_private_key(path: &Path) -> std::io::Result<PrivateKeyDer<'static>> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    match rustls_pemfile::private_key(&mut reader) {
+        Ok(Some(key)) => Ok(key),
+        Ok(None) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "No private key found",
+        )),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn start_server(config: Config) {
     let base_dir = std::env::current_dir()
         .unwrap()
         .join(&config.paths.content_dir);
 
-    let theme_mtime = fs::metadata(&config.paths.theme_file)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-
-    let mut env = Environment::new();
-    let theme_html = fs::read_to_string(&config.paths.theme_file)
-        .unwrap_or_else(|_| "{{ content|safe }}".to_string());
-    env.add_template_owned("index", theme_html).unwrap();
-
-    let precomputed_headers = format!(
+    let precomputed_headers: Arc<[u8]> = format!(
         "Server: {}\r\nX-Content-Type-Options: {}\r\nX-Frame-Options: {}\r\nContent-Security-Policy: {}\r\nAccess-Control-Allow-Origin: {}\r\n",
         config.server.name,
         config.security.x_content_type_options,
         config.security.x_frame_options,
         config.security.content_security_policy,
         config.security.cors_allow_origin
-    );
+    ).into_bytes().into();
+
+    let tls_config = if config.tls.enabled {
+        info!("Loading TLS certificates...");
+        let certs = load_certs(Path::new(&config.tls.cert_path)).expect("Failed to load TLS certs");
+        let key = load_private_key(Path::new(&config.tls.key_path))
+            .expect("Failed to load TLS private key");
+
+        let mut cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("Bad TLS configuration");
+
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Some(Arc::new(cfg))
+    } else {
+        None
+    };
+
+    let running = Arc::new(AtomicBool::new(true));
 
     let state = Arc::new(ServerState {
         base_dir,
         page_cache: ShardedLruCache::new(config.performance.max_cache_items),
-        theme_state: RwLock::new((theme_mtime, Arc::new(env))),
+        dir_cache: ShardedLruCache::new(std::cmp::max(1, config.performance.max_cache_items / 4)),
+        theme_state: RwLock::new((0, Arc::new(Environment::new()))),
         config: config.clone(),
         precomputed_headers,
         active_connections: AtomicUsize::new(0),
+        tls_config,
+        is_running: Arc::clone(&running),
     });
 
     let host_port = format!("{}:{}", config.server.host, config.server.port);
     let listener = TcpListener::bind(&host_port).expect("Failed to bind to port");
-    info!("Server started at http://{}", host_port);
+    info!(
+        "Server running at {}://{}",
+        if config.tls.enabled { "https" } else { "http" },
+        host_port
+    );
+
+    let r = Arc::clone(&running);
+    let host_clone = config.server.host.clone();
+    let port_clone = config.server.port;
+
+    ctrlc::set_handler(move || {
+        info!("Received shutdown signal. Initiating graceful drain...");
+        r.store(false, Ordering::SeqCst);
+        let _ = TcpStream::connect(format!("{}:{}", host_clone, port_clone));
+    })
+    .unwrap_or_else(|e| warn!("Error setting Ctrl-C handler: {}", e));
 
     let pool = ThreadPool::new(config.server.threads, config.server.queue_size);
 
-    for mut stream in listener.incoming().flatten() {
-        let _ = stream.set_nodelay(true);
+    for stream_res in listener.incoming() {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
 
-        let state_clone = Arc::clone(&state);
+        match stream_res {
+            Ok(mut stream) => {
+                let _ = stream.set_nodelay(true);
+                let state_clone = Arc::clone(&state);
 
-        match stream.try_clone() {
-            Ok(stream_clone) => {
-                if pool
-                    .execute(move || handle_connection(stream_clone, state_clone))
-                    .is_err()
-                {
-                    warn!("Queue full, shedding load with 503.");
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-                    let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                match stream.try_clone() {
+                    Ok(stream_clone) => {
+                        let lumen_stream = if let Some(tls_cfg) = &state.tls_config {
+                            let conn = ServerConnection::new(Arc::clone(tls_cfg)).unwrap();
+                            LumenStream::Tls(Box::new(StreamOwned::new(conn, stream_clone)))
+                        } else {
+                            LumenStream::Plain(stream_clone)
+                        };
+
+                        if pool
+                            .execute(move || handle_connection(lumen_stream, state_clone))
+                            .is_err()
+                        {
+                            warn!("Queue full, shedding load with 503.");
+                            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                        }
+                    }
+                    Err(e) => error!("Failed to clone stream: {}", e),
                 }
             }
-            Err(e) => {
-                error!("Failed to clone stream: {}", e);
-            }
+            Err(e) => error!("Failed to accept connection: {}", e),
         }
     }
+
+    info!("Stopped accepting new connections. Waiting for active connections to finish...");
+    while state.active_connections.load(Ordering::SeqCst) > 0 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    info!("All connections closed. Server gracefully stopped.");
 }
 
 struct ConnectionGuard<'a> {
@@ -90,7 +201,7 @@ impl<'a> Drop for ConnectionGuard<'a> {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
+fn handle_connection(mut stream: LumenStream, state: Arc<ServerState>) {
     state.active_connections.fetch_add(1, Ordering::SeqCst);
     let _guard = ConnectionGuard {
         counter: &state.active_connections,
@@ -106,16 +217,19 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
     let mut buffer = vec![0; state.config.performance.connection_buffer_size];
     let mut read_offset = 0;
     let mut is_first_request = true;
-    let mut absolute_deadline;
+
+    let mut absolute_deadline = Instant::now() + default_timeout;
 
     loop {
-        if !is_first_request {
-            absolute_deadline = Instant::now() + idle_ka_timeout;
-            let _ = stream.set_read_timeout(Some(idle_ka_timeout));
-        } else {
-            absolute_deadline = Instant::now() + default_timeout;
-            let _ = stream.set_read_timeout(Some(default_timeout));
+        let now = Instant::now();
+        if now >= absolute_deadline {
+            if is_first_request {
+                let _ = send_error(&mut stream, 408, b"Request Timeout", false, &state);
+            }
+            break;
         }
+
+        let _ = stream.set_read_timeout(Some(absolute_deadline.duration_since(now)));
 
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = Request::new(&mut headers);
@@ -125,8 +239,9 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
                 let mut keep_alive = is_keep_alive(&req);
 
                 if keep_alive
-                    && state.active_connections.load(Ordering::Relaxed)
-                        >= state.config.server.threads
+                    && (!state.is_running.load(Ordering::Relaxed)
+                        || state.active_connections.load(Ordering::Relaxed)
+                            >= state.config.server.threads)
                 {
                     keep_alive = false;
                 }
@@ -160,6 +275,8 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
                 if !keep_alive_result {
                     break;
                 }
+
+                absolute_deadline = Instant::now() + idle_ka_timeout;
                 continue;
             }
             Ok(httparse::Status::Partial) => {
@@ -180,16 +297,6 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
             }
         }
 
-        let now = Instant::now();
-        if now >= absolute_deadline {
-            if is_first_request {
-                let _ = send_error(&mut stream, 408, b"Request Timeout", false, &state);
-            }
-            break;
-        }
-
-        let _ = stream.set_read_timeout(Some(absolute_deadline.duration_since(now)));
-
         match stream.read(&mut buffer[read_offset..]) {
             Ok(0) => break, // EOF
             Ok(n) => read_offset += n,
@@ -203,7 +310,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
                 break;
             }
             Err(e) => {
-                debug!("Connection read error: {}", e);
+                debug!("Connection read/TLS handshake error: {}", e);
                 break;
             }
         }

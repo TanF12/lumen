@@ -5,6 +5,7 @@ use std::{fs, path::Path};
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
+    pub tls: TlsConfig,
     pub paths: PathConfig,
     pub security: SecurityConfig,
     pub performance: PerformanceConfig,
@@ -36,9 +37,26 @@ impl Default for ServerConfig {
 }
 
 #[derive(Deserialize, Clone)]
+pub struct TlsConfig {
+    pub enabled: bool,
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: "certs/cert.pem".into(),
+            key_path: "certs/key.pem".into(),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone)]
 pub struct PathConfig {
     pub content_dir: String,
-    pub theme_file: String,
+    pub theme_dir: String,
     pub fallback_404: String,
 }
 
@@ -46,7 +64,7 @@ impl Default for PathConfig {
     fn default() -> Self {
         Self {
             content_dir: "content".into(),
-            theme_file: "themes/default/index.html".into(),
+            theme_dir: "themes/default".into(),
             fallback_404: "404".into(),
         }
     }

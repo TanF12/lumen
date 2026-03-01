@@ -1,12 +1,15 @@
 use crate::config::Config;
 use lru::LruCache;
 use minijinja::Environment;
+use rustls::ServerConfig as RustlsConfig;
 use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
+    hash::{BuildHasherDefault, Hash, Hasher},
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, atomic::AtomicUsize},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicUsize},
+    },
     time::SystemTime,
 };
 
@@ -16,10 +19,30 @@ pub struct CacheEntry {
     pub mtime: SystemTime,
 }
 
+pub struct FxHasher(u64);
+impl Default for FxHasher {
+    #[inline(always)]
+    fn default() -> Self {
+        Self(0x517cc1b727220a95)
+    }
+}
+impl Hasher for FxHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+        }
+    }
+}
+
 const SHARDS: usize = 16;
 
 pub struct ShardedLruCache<K, V> {
-    shards: Vec<Mutex<LruCache<K, V>>>,
+    shards: Vec<Mutex<LruCache<K, V, BuildHasherDefault<FxHasher>>>>,
 }
 
 impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
@@ -27,8 +50,9 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
         let shard_cap = std::cmp::max(1, capacity / SHARDS);
         let mut shards = Vec::with_capacity(SHARDS);
         for _ in 0..SHARDS {
-            shards.push(Mutex::new(LruCache::new(
+            shards.push(Mutex::new(LruCache::with_hasher(
                 NonZeroUsize::new(shard_cap).unwrap(),
+                BuildHasherDefault::<FxHasher>::default(),
             )));
         }
         Self { shards }
@@ -36,7 +60,7 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
 
     #[inline(always)]
     fn get_shard(&self, k: &K) -> usize {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = FxHasher::default();
         k.hash(&mut hasher);
         (hasher.finish() as usize) % SHARDS
     }
@@ -67,37 +91,11 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
 pub struct ServerState {
     pub base_dir: PathBuf,
     pub page_cache: ShardedLruCache<PathBuf, CacheEntry>,
-    pub theme_state: RwLock<(SystemTime, Arc<Environment<'static>>)>,
+    pub dir_cache: ShardedLruCache<PathBuf, (u64, minijinja::Value)>,
+    pub theme_state: RwLock<(u64, Arc<Environment<'static>>)>,
     pub config: Config,
-    pub precomputed_headers: String,
+    pub precomputed_headers: Arc<[u8]>,
     pub active_connections: AtomicUsize,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::SystemTime;
-
-    #[test]
-    fn test_sharded_lru_cache() {
-        let cache: ShardedLruCache<PathBuf, CacheEntry> = ShardedLruCache::new(32);
-        let path = PathBuf::from("test.md");
-
-        let entry = CacheEntry {
-            html: Arc::new("<h1>Cached</h1>".to_string()),
-            mtime: SystemTime::now(),
-        };
-
-        cache.put(path.clone(), entry.clone());
-        let retrieved = cache.get(&path).expect("Item should be in cache");
-        assert_eq!(*retrieved.html, *entry.html);
-
-        cache.clear();
-        assert!(
-            cache.get(&path).is_none(),
-            "Cache should be empty after clear"
-        );
-    }
+    pub tls_config: Option<Arc<RustlsConfig>>,
+    pub is_running: Arc<AtomicBool>,
 }

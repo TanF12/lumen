@@ -91,7 +91,17 @@ impl ThreadPool {
                             }));
                         }
                         None => {
-                            parker.wait();
+                            let mut spun = false;
+                            for _ in 0..64 {
+                                if pending.load(Ordering::Relaxed) > 0 {
+                                    spun = true;
+                                    break;
+                                }
+                                std::hint::spin_loop();
+                            }
+                            if !spun {
+                                parker.wait();
+                            }
                         }
                     }
                 }
