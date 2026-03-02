@@ -111,22 +111,41 @@ max_markdown_size_mb = 5
         )?;
     }
 
+    let home_theme_path = base.join("themes/default/home.html");
+    if !home_theme_path.exists() {
+        fs::write(
+            &home_theme_path,
+            r#"<!DOCTYPE html>
+<html>
+<head><title>{{ title }}</title></head>
+<body>
+<main>
+    <h1>{{ title }}</h1>
+    {{ content|safe }}
+
+    <h2>Recent Posts</h2>
+    <ul>
+    {% for post in list_dir("posts") %}
+      <li><a href="{{ post.url }}">{{ post.title }}</a> - {{ post.date }}</li>
+    {% endfor %}
+    </ul>
+</main>
+</body>
+</html>"#,
+        )?;
+    }
+
     let md_path = base.join("content/index.md");
     if !md_path.exists() {
         fs::write(
             &md_path,
             r#"---
 title: "Welcome to Lumen"
+template: "home.html"
 cache: false
 ---
 Server is running successfully!
-
-## Recent Posts
-<ul>
-{% for post in list_dir("posts") %}
-  <li><a href="{{ post.url }}">{{ post.title }}</a> - {{ post.date }}</li>
-{% endfor %}
-</ul>"#,
+"#,
         )?;
     }
 
