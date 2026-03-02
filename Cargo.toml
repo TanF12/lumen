@@ -1,0 +1,26 @@
+[package]
+name = "lumen"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+httparse = "1.8"
+pulldown-cmark = "0.13.1"
+minijinja = { version = "2.16.0", features =["loader"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9.8"
+yaml-rust2 = "0.11"
+clap = { version = "4.5", features = ["derive"] }
+percent-encoding = "2.3"
+mime_guess = "2.0"
+httpdate = "1.0"
+crossbeam-deque = "0.8"
+lru = "0.16.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+itoa = "1.0"
+ctrlc = "3.4"
+brotli = "8.0.2"
+flate2 = "1.0"
+mio = { version = "1.1.1", features = ["os-poll", "net"] }
+bytes = "1.5"
